@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Flight arrivals ingestion stack for IAD/LHR. Creates DynamoDB storage,
+  ingest Lambda, IAM role/policies, EventBridge schedule, and invoke permissions.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: flight-arrivals
+    Description: Prefix used for named resources.
+
+  LambdaFunctionName:
+    Type: String
+    Default: flight-arrivals-ingest
+    Description: Name of the ingest Lambda function.
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 bucket that stores the Lambda deployment package zip.
+
+  LambdaCodeS3Key:
+    Type: String
+    Description: S3 object key for the Lambda deployment package zip.
+
+  LambdaRuntime:
+    Type: String
+    Default: python3.11
+    AllowedValues:
+      - python3.10
+      - python3.11
+      - python3.12
+    Description: Python runtime for the ingest Lambda.
+
+  IngestScheduleExpression:
+    Type: String
+    Default: rate(15 minutes)
+    Description: EventBridge schedule expression, for example rate(15 minutes).
+
+  AirportsCsv:
+    Type: String
+    Default: IAD,LHR
+    Description: Comma-separated airport list used by the Lambda.
+
+  OpenSkyUsername:
+    Type: String
+    Default: ''
+    Description: Optional OpenSky username to increase free API limits.
+
+  OpenSkyPassword:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Optional OpenSky password.
+
+Resources:
+  FlightArrivalsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-table
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: airport
+          AttributeType: S
+        - AttributeName: arrival_time
+          AttributeType: S
+        - AttributeName: airline
+          AttributeType: S
+      KeySchema:
+        - AttributeName: airport
+          KeyType: HASH
+        - AttributeName: arrival_time
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: AirlineIndex
+          KeySchema:
+            - AttributeName: airline
+              KeyType: HASH
+            - AttributeName: arrival_time
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  IngestLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${LambdaFunctionName}
+      RetentionInDays: 14
+
+  IngestLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-lambda-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${LambdaFunctionName}:*
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt FlightArrivalsTable.Arn
+                  - !Sub ${FlightArrivalsTable.Arn}/index/*
+
+  FlightArrivalsIngestLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: !Ref LambdaRuntime
+      Handler: pipeline.ingest_lambda_handler
+      Role: !GetAtt IngestLambdaExecutionRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FlightArrivalsTable
+          AIRPORTS: !Ref AirportsCsv
+          INGEST_SCHEDULE: !Ref IngestScheduleExpression
+          OPENSKY_API_BASE: https://opensky-network.org/api
+          OPENSKY_USERNAME: !Ref OpenSkyUsername
+          OPENSKY_PASSWORD: !Ref OpenSkyPassword
+      TracingConfig:
+        Mode: Active
+
+  FlightArrivalsScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ProjectName}-ingest-schedule
+      Description: Triggers the flight arrivals ingest Lambda on a schedule.
+      ScheduleExpression: !Ref IngestScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt FlightArrivalsIngestLambda.Arn
+          Id: flight-arrivals-ingest-target
+
+  AllowEventBridgeInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FlightArrivalsIngestLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FlightArrivalsScheduleRule.Arn
+
+Outputs:
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table storing flight arrivals.
+    Value: !Ref FlightArrivalsTable
+
+  DynamoDBTableArn:
+    Description: ARN of the DynamoDB table.
+    Value: !GetAtt FlightArrivalsTable.Arn
+
+  LambdaFunctionName:
+    Description: Name of the ingest Lambda function.
+    Value: !Ref FlightArrivalsIngestLambda
+
+  LambdaFunctionArn:
+    Description: ARN of the ingest Lambda function.
+    Value: !GetAtt FlightArrivalsIngestLambda.Arn
+
+  ScheduleRuleName:
+    Description: Name of the EventBridge schedule rule.
+    Value: !Ref FlightArrivalsScheduleRule
+    
