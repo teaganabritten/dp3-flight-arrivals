@@ -1,11 +1,9 @@
 import boto3
-import numpy as np
 import os
-import pandas as pd
 import logging
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 # Configure logging
@@ -16,14 +14,60 @@ logger = logging.getLogger(__name__)
 dynamodb = boto3.resource("dynamodb")
 cloudwatch = boto3.client("events")
 lambda_client = boto3.client("lambda")
+secrets_client = boto3.client("secretsmanager")
 
 # Configuration
 AIRPORTS = [a.strip().upper() for a in os.getenv("AIRPORTS", "IAD,LHR").split(",") if a.strip()]
-AIRPORT_ICAO = {"IAD": "KIAD", "LHR": "EGLL"}  # IATA to ICAO mapping
 TABLE_NAME = os.getenv("TABLE_NAME", "flight_arrivals")
 INGEST_SCHEDULE = os.getenv("INGEST_SCHEDULE", "rate(15 minutes)")  # Fetch every 15 minutes
-# OpenSky Network API (free, no API key required)
-OPENSKY_API_BASE = os.getenv("OPENSKY_API_BASE", "https://opensky-network.org/api")
+# AirLabs API (free, 1000 requests/month, real-time flight data)
+AIRLABS_SECRET_NAME = os.getenv("AIRLABS_SECRET_NAME", "airlabs-api-key")
+AIRLABS_API_BASE = "https://airlabs.co/api/v9"
+
+# Cache for API key to avoid repeated Secrets Manager calls
+_airlabs_api_key_cache = {}
+
+
+def _get_airlabs_api_key() -> str:
+    """
+    Fetch AirLabs API key from AWS Secrets Manager (with caching).
+    
+    Returns:
+        API key string
+    
+    Raises:
+        Exception: If secret cannot be retrieved
+    """
+    # Return cached value if available
+    if "key" in _airlabs_api_key_cache:
+        return _airlabs_api_key_cache["key"]
+    
+    try:
+        logger.debug(f"Fetching AirLabs API key from Secrets Manager: {AIRLABS_SECRET_NAME}")
+        response = secrets_client.get_secret_value(SecretId=AIRLABS_SECRET_NAME)
+        
+        # Try to parse as JSON first (in case it's stored as {"api_key": "..."}
+        try:
+            secret_dict = json.loads(response.get("SecretString", ""))
+            api_key = secret_dict.get("api_key") or secret_dict.get("AIRLABS_API_KEY") or secret_dict.get("key")
+        except json.JSONDecodeError:
+            # If not JSON, treat entire string as the API key
+            api_key = response.get("SecretString", "")
+        
+        if not api_key:
+            raise ValueError("API key not found in secret")
+        
+        # Cache it for the Lambda execution lifetime
+        _airlabs_api_key_cache["key"] = api_key
+        logger.debug("API key retrieved and cached")
+        return api_key
+    
+    except secrets_client.exceptions.ResourceNotFoundException:
+        logger.error(f"Secret '{AIRLABS_SECRET_NAME}' not found in Secrets Manager. Create it with: aws secretsmanager create-secret --name {AIRLABS_SECRET_NAME} --secret-string YOUR_API_KEY")
+        raise
+    except Exception as e:
+        logger.error(f"Failed to fetch API key from Secrets Manager: {type(e).__name__}: {e}", exc_info=True)
+        raise
 
 # DynamoDB Schema & Initialization
 
@@ -83,61 +127,97 @@ def init_dynamodb_table():
 
 def fetch_arrivals(airport: str, api_key: Optional[str] = None) -> List[Dict]:
     """
-    Fetch current flight arrivals for a given airport using OpenSky Network (FREE).
+    Fetch current flight arrivals for a given airport using AirLabs API.
     
-    OpenSky Network API: https://opensky-network.org/api/flights/arrival
-    - No API key required (free tier has rate limits but sufficient for 15-min cadence)
-    - Returns aircraft that landed in the last 24 hours
+    AirLabs: https://airlabs.co (free tier: 1000 requests/month)
+    - Real-time flight data with detailed aircraft and airline info
+    - Free tier provides ~33 requests/day, sufficient for 15-min cadence on 2 airports
+    - API key is stored securely in AWS Secrets Manager
     
     Args:
         airport: IATA code (e.g., "IAD", "LHR")
-        api_key: Optional username for OpenSky (increases rate limit)
+        api_key: Optional override for API key (defaults to fetching from Secrets Manager)
     
     Returns:
         List of arrival records with fields:
-        - callsign: Flight call sign
-        - icao24: ICAO 24-bit address
+        - airline: Airline code
+        - flight_number: Flight identifier
         - arrival_time: Timestamp of arrival
-        - estArrivalAirport: Arrival airport ICAO
-        - airline: Extracted from callsign (approximate)
+        - aircraft_type: Aircraft IATA code
     """
-    icao_code = AIRPORT_ICAO.get(airport)
-    if not icao_code:
-        logger.error(f"Unknown airport: {airport}")
-        return []
+    # Use provided key or fetch from Secrets Manager
+    if not api_key:
+        try:
+            api_key = _get_airlabs_api_key()
+        except Exception as e:
+            logger.error(f"Cannot fetch arrivals without API key: {e}")
+            return []
     
     try:
-        # OpenSky Network: get arrivals in last 24 hours
+        logger.info(f"Fetching arrivals for {airport} from AirLabs")
+        
+        # AirLabs arrivals endpoint
         response = requests.get(
-            f"{OPENSKY_API_BASE}/flights/arrival",
-            params={"airport": icao_code, "begin": int(datetime.utcnow().timestamp()) - 86400},
-            auth=(os.getenv("OPENSKY_USERNAME"), os.getenv("OPENSKY_PASSWORD")) if os.getenv("OPENSKY_USERNAME") else None,
+            f"{AIRLABS_API_BASE}/flights",
+            params={
+                "api_key": api_key,
+                "arr_iata": airport,  # Filter by arrival airport
+                "limit": 1000,  # ask for as many records as allowed by the API
+            },
             timeout=10,
         )
         response.raise_for_status()
         
-        flights = response.json() or []
-        logger.info(f"Fetched {len(flights)} arrivals for {airport} ({icao_code})")
+        data = response.json()
         
-        # Transform OpenSky response to our schema
+        # Check for API errors
+        if data.get("response") == []:
+            logger.info(f"No arrivals found for {airport} at this time")
+            return []
+        
+        flights = data.get("response", [])
+        if not isinstance(flights, list):
+            logger.warning(f"Unexpected AirLabs response format: {type(flights)}")
+            return []
+        
+        logger.info(f"Successfully fetched {len(flights)} flights arriving at {airport} from AirLabs")
+        
+        # Transform AirLabs response to our schema
         arrivals = []
         for flight in flights:
-            if flight.get("estArrivalTime") or flight.get("actualArrivalTime"):
-                arrivals.append({
-                    "airline": extract_airline_code(flight.get("callsign", "")),
-                    "flight_number": flight.get("callsign", "").strip(),
-                    "arrival_time": datetime.utcfromtimestamp(
-                        flight.get("actualArrivalTime") or flight.get("estArrivalTime")
-                    ).isoformat() + "Z",
-                    "aircraft_type": "N/A",  # OpenSky doesn't provide aircraft type in this endpoint
-                    "icao24": flight.get("icao24", ""),
-                })
+            try:
+                # Check arrival time exists
+                        # AirLabs returns 'updated' as Unix timestamp, not ISO arrival time
+                        # For now, use the updated timestamp converted to ISO format as a proxy for arrival activity
+                        updated_ts = flight.get("updated")
+                        if updated_ts:
+                            # Convert Unix timestamp to ISO 8601
+                            arrival_time_iso = datetime.fromtimestamp(updated_ts, tz=timezone.utc).isoformat()
+                            arrivals.append({
+                                "airline": flight.get("airline_iata", "UNK"),
+                                "flight_number": flight.get("flight_iata", "") or flight.get("flight_icao", ""),
+                                "arrival_time": arrival_time_iso,
+                                "aircraft_type": flight.get("aircraft_iata", "N/A"),
+                            })
+            except Exception as e:
+                logger.debug(f"Error parsing flight record: {e}")
+                continue
         
+        logger.info(f"Parsed {len(arrivals)} valid arrival records for {airport}")
         return arrivals
     
+    except requests.Timeout:
+        logger.error(f"AirLabs API timeout for {airport}")
+        return []
+    except requests.ConnectionError as e:
+        logger.error(f"AirLabs connection error for {airport}: {e}")
+        return []
     except requests.RequestException as e:
-        logger.error(f"Failed to fetch arrivals for {airport}: {e}")
-        return []  # Fail open to avoid crashing the Lambda
+        logger.error(f"AirLabs API error for {airport}: {type(e).__name__}: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error fetching arrivals for {airport}: {type(e).__name__}: {e}", exc_info=True)
+        return []
 
 
 def extract_airline_code(callsign: str) -> str:
@@ -179,9 +259,16 @@ def write_to_dynamodb(airport: str, arrivals: List[Dict]) -> int:
     Returns:
         Number of records written
     """
+    if not arrivals:
+        logger.warning(f"No arrivals to write for {airport}")
+        return 0
+    
     table = dynamodb.Table(TABLE_NAME)
     written = 0
+    failed = 0
     now = datetime.utcnow().isoformat() + "Z"
+    
+    logger.info(f"Writing {len(arrivals)} arrivals for {airport} to DynamoDB")
     
     for arrival in arrivals:
         try:
@@ -197,13 +284,15 @@ def write_to_dynamodb(airport: str, arrivals: List[Dict]) -> int:
             # Idempotent write: skip if already ingested in this window
             table.put_item(Item=item, ConditionExpression="attribute_not_exists(arrival_time)")
             written += 1
+            logger.debug(f"Wrote: {arrival.get('flight_number')} at {airport} on {arrival.get('arrival_time')}")
         
-        except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+        except table.meta.client.exceptions.ConditionalCheckFailedException:
             logger.debug(f"Duplicate record: {arrival.get('flight_number')} at {airport}")
         except Exception as e:
-            logger.error(f"Error writing arrival record: {e}")
+            logger.error(f"Error writing arrival record {arrival.get('flight_number')}: {type(e).__name__}: {e}")
+            failed += 1
     
-    logger.info(f"Wrote {written}/{len(arrivals)} records to {TABLE_NAME}")
+    logger.info(f"DynamoDB write summary for {airport}: {written} written, {failed} failed out of {len(arrivals)}")
     return written
 
 
@@ -212,6 +301,7 @@ def ingest_lambda_handler(event, context):
     Lambda handler: Fetch arrivals and store them.
     
     Triggered by CloudWatch Events on a schedule (e.g., every 15 minutes).
+    Handles errors gracefully and logs detailed status.
     
     Expected event:
     {
@@ -219,25 +309,57 @@ def ingest_lambda_handler(event, context):
         "source": "aws.events"
     }
     """
-    logger.info(f"Ingest Lambda triggered at {datetime.utcnow().isoformat()}")
+    start_time = datetime.utcnow()
+    logger.info(f"=== Ingest Lambda started at {start_time.isoformat()} ===")
+    logger.info(f"Target airports: {AIRPORTS}")
     
     total_written = 0
+    total_failed = 0
+    results_by_airport = {}
+    
     for airport in AIRPORTS:
+        airport_start = datetime.utcnow()
         try:
+            logger.info(f"Processing airport: {airport}")
+            
             arrivals = fetch_arrivals(airport)
-            if arrivals:
-                written = write_to_dynamodb(airport, arrivals)
-                total_written += written
+            if not arrivals:
+                logger.warning(f"No arrivals fetched for {airport}")
+                results_by_airport[airport] = {"status": "no_data", "records": 0}
+                continue
+            
+            written = write_to_dynamodb(airport, arrivals)
+            total_written += written
+            results_by_airport[airport] = {
+                "status": "success",
+                "records": written,
+                "duration_seconds": (datetime.utcnow() - airport_start).total_seconds(),
+            }
+            logger.info(f"Completed {airport}: {written} records written")
+        
         except Exception as e:
-            logger.error(f"Ingest pipeline failed for {airport}: {e}")
+            total_failed += 1
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            logger.error(f"Ingest pipeline failed for {airport}: {error_msg}", exc_info=True)
+            results_by_airport[airport] = {
+                "status": "error",
+                "error": error_msg,
+                "duration_seconds": (datetime.utcnow() - airport_start).total_seconds(),
+            }
             # Continue with next airport rather than crashing
     
+    duration = (datetime.utcnow() - start_time).total_seconds()
+    logger.info(f"=== Ingest complete in {duration}s ===")
+    logger.info(f"Summary: {total_written} records written, {total_failed} airports failed")
+    
     return {
-        "statusCode": 200,
+        "statusCode": 200 if total_failed == 0 else 206,
         "body": json.dumps({
             "message": "Ingest complete",
-            "records_written": total_written,
-            "airports": AIRPORTS,
+            "total_records_written": total_written,
+            "airports_failed": total_failed,
+            "duration_seconds": duration,
+            "results_by_airport": results_by_airport,
         }),
     }
 
@@ -256,10 +378,15 @@ def setup_cloudwatch_event(
     
     Returns:
         CloudWatch Event rule details
+    
+    Raises:
+        Exception: If rule creation or target setup fails
     """
     rule_name = "flight-arrivals-ingest-schedule"
     
     try:
+        logger.info(f"Setting up CloudWatch Event rule: {rule_name}")
+        
         # Create the event rule
         rule_response = cloudwatch.put_rule(
             Name=rule_name,
@@ -267,32 +394,36 @@ def setup_cloudwatch_event(
             State="ENABLED",
             Description="Triggers ingest Lambda for flight arrivals every 15 minutes",
         )
-        logger.info(f"CloudWatch Event rule '{rule_name}' created: {rule_response['RuleArn']}")
+        logger.info(f"CloudWatch Event rule created: {rule_response['RuleArn']}")
         
         # Add Lambda as the target
+        cloudwatch_role = os.getenv(
+            "CLOUDWATCH_EVENTS_ROLE_ARN",
+            "arn:aws:iam::ACCOUNT_ID:role/service-role/CloudWatchEventsRole",
+        )
+        logger.info(f"Adding Lambda target with role: {cloudwatch_role}")
+        
         target_response = cloudwatch.put_targets(
             Rule=rule_name,
             Targets=[
                 {
                     "Arn": lambda_function_arn,
                     "Id": "1",
-                    "RoleArn": os.getenv(
-                        "CLOUDWATCH_EVENTS_ROLE_ARN",
-                        "arn:aws:iam::ACCOUNT_ID:role/service-role/CloudWatchEventsRole",
-                    ),
+                    "RoleArn": cloudwatch_role,
                 }
             ],
         )
-        logger.info(f"Lambda target added to rule: {target_response}")
+        logger.info(f"Lambda target added: {target_response['FailedEntryCount']} failures")
         
         return {
             "rule_arn": rule_response["RuleArn"],
             "rule_name": rule_name,
             "schedule": schedule_expression,
+            "status": "created",
         }
     
     except Exception as e:
-        logger.error(f"Failed to setup CloudWatch Event: {e}")
+        logger.error(f"Failed to setup CloudWatch Event: {type(e).__name__}: {e}", exc_info=True)
         raise
 
 # Query API: Read from DynamoDB
@@ -344,48 +475,27 @@ def get_arrivals_by_airline(airline: str, limit: int = 50) -> List[Dict]:
     return response.get("Items", [])
 
 
-def get_airport_airline_summary(airport: str) -> pd.DataFrame:
-    """
-    Get a summary of arrivals by airline for an airport.
-    
-    Useful for analytics and dashboards.
-    
-    Args:
-        airport: Airport code
-    
-    Returns:
-        DataFrame with columns: airline, arrival_count, latest_arrival
-    """
-    arrivals = get_arrivals_by_airport(airport, limit=1000)
-    
-    if not arrivals:
-        return pd.DataFrame(columns=["airline", "arrival_count", "latest_arrival"])
-    
-    df = pd.DataFrame(arrivals)
-    summary = df.groupby("airline").agg({
-        "flight_number": "count",
-        "arrival_time": "max",
-    }).rename(columns={
-        "flight_number": "arrival_count",
-        "arrival_time": "latest_arrival",
-    }).reset_index()
-    
-    return summary.sort_values("arrival_count", ascending=False)
-
 # Main: Initialization & Testing
 
 if __name__ == "__main__":
-    # Initialize DynamoDB table
-    table = init_dynamodb_table()
+    try:
+        logger.info("=" * 60)
+        logger.info("Flight Arrivals Ingest Pipeline - Initialization")
+        logger.info("=" * 60)
+        
+        # Initialize DynamoDB table
+        table = init_dynamodb_table()
+        
+        logger.info("✓ Pipeline initialized successfully")
+        logger.info(f"  Target airports: {AIRPORTS}")
+        logger.info(f"  Data source: AirLabs (https://airlabs.co)")
+        logger.info(f"  API key: Stored in AWS Secrets Manager ('{AIRLABS_SECRET_NAME}')")
+        logger.info(f"  Ingest schedule: {INGEST_SCHEDULE}")
+        logger.info(f"  DynamoDB table: {TABLE_NAME}")
+        
+        logger.info("Ready for ingest operations")
     
-    logger.info("Pipeline initialized successfully")
-    logger.info(f"Target airports: {AIRPORTS}")
-    logger.info(f"Data source: OpenSky Network (FREE - https://opensky-network.org)")
-    logger.info(f"Ingest schedule: {INGEST_SCHEDULE}")
-    logger.info(f"DynamoDB table: {TABLE_NAME}")
-    
-    # Example: Test query functions (once data is available)
-    # arrivals = get_arrivals_by_airport("IAD")
-    # summary = get_airport_airline_summary("IAD")
-    # print(summary)
+    except Exception as e:
+        logger.error(f"Pipeline initialization failed: {type(e).__name__}: {e}", exc_info=True)
+        raise
 

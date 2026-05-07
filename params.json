@@ -1,0 +1,9 @@
+[
+	{ "ParameterKey": "ProjectName", "ParameterValue": "flight-arrivals" },
+	{ "ParameterKey": "LambdaFunctionName", "ParameterValue": "flight-arrivals-ingest" },
+	{ "ParameterKey": "LambdaCodeS3Bucket", "ParameterValue": "uup3cy" },
+	{ "ParameterKey": "LambdaCodeS3Key", "ParameterValue": "pipeline.zip" },
+	{ "ParameterKey": "LambdaRuntime", "ParameterValue": "python3.11" },
+	{ "ParameterKey": "IngestScheduleExpression", "ParameterValue": "rate(15 minutes)" },
+	{ "ParameterKey": "AirportsCsv", "ParameterValue": "IAD,LHR" }
+]
