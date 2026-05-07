@@ -2,6 +2,7 @@ import os
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
+import urllib.parse
 
 import json
 import requests
@@ -404,7 +405,13 @@ def plot():
 
         combined_bytes = _build_side_by_side_svg(items_map, window_hours)
         combined_url = _store_plot(combined_bytes, "all", window_hours)
-        return {"response": {"combined": combined_url, "per_airport": per_urls}}
+        # Also include an inline data URL for immediate display (avoids presigned URL token expiry)
+        try:
+            combined_text = combined_bytes.decode('utf-8')
+            combined_inline = "data:image/svg+xml;utf8," + urllib.parse.quote(combined_text)
+        except Exception:
+            combined_inline = None
+        return {"response": {"combined": combined_url, "combined_inline": combined_inline, "per_airport": per_urls}}
     else:
         items = _collect_items(airport, cutoff=cutoff)
         if not items:
